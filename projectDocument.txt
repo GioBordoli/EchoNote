@@ -1,0 +1,119 @@
+**Meeting Transcription Backend – Project Overview (Updated)**
+
+### Purpose
+
+• Provide a lightweight backend that turns Italian (or English) office‑meeting audio into accurate, speaker‑diarised text and a short summary.
+• Expose simple REST endpoints so the mobile app can upload audio and retrieve transcripts/notes.
+• Keep architecture minimal, scalable, and cost‑effective for an early‑stage product.
+
+### Key Decisions (2025‑06‑02)
+
+• **Auth flow** – Email + password MVP (JWT). Google OAuth will be added later.
+• **Tenant model** – Single‑user isolation. No organisations/teams yet.
+• **Data retention** – Raw audio kept in GCS for 7 days then auto‑deleted by Lifecycle rules.
+• **Transcription mode** – Async only; no real‑time streaming for now.
+• **Speaker diarization** – Required. Use Google Cloud video model with `enableSpeakerDiarization=true`.
+• **Audio limits** – No hard duration cap; backend must handle up to several hours. Cloud Run timeout set to 15 min per chunk; long files processed in parallel chunks.
+• **Languages** – User chooses "it" or "en". Auto‑detect disabled.
+• **Post‑processing** – Generate summary & key‑points via PaLM 2 or Gemini API (Italian & English supported).
+• **Access control** – Users see only their own transcripts.
+• **Password reset** – Email link using SendGrid (no e‑mail confirmation pre‑sign‑in).
+• **Environments** – Single prod environment. Feature flags if differentiation needed later.
+• **Infrastructure as Code** – Terraform for all GCP resources.
+• **Testing targets** – 70‑80 % unit coverage on core logic; 30‑50 % integration on critical flows.
+• **Status updates** – Backend writes transcript status changes to Firestore → triggers Cloud Function to send push via FCM/APNs. No polling.
+• **Usage metrics** – Track seconds transcribed per user; expose in `usage` table for flat monthly billing.
+
+### Tech Stack
+
+• **Google Cloud**
+• Cloud Run (FastAPI container) – auto‑scales 0→N.
+• Cloud Storage – raw audio (7‑day TTL bucket) + processed chunks.
+• Cloud Speech‑to‑Text (Chirp, video model) – diarization, punctuation.
+• PaLM 2 / Gemini Pro Vision – text summarisation & bullet points.
+• Cloud SQL (PostgreSQL) – relational data.
+• Firestore (native mode) – real‑time status updates for push notifications.
+• Secret Manager – DB creds, JWT secret.
+• Cloud Logging + Error Reporting + Cloud Trace.
+
+• **Python 3.12 + FastAPI**
+• Async endpoints; Pydantic v2; auto OpenAPI docs.
+• Dependencies: `google-cloud-speech`, `google-cloud-storage`, `pydub`, `ffmpeg-python`, `sqlalchemy`, `asyncpg`, `argon2-cffi`, `python-jose`, `google-cloud-pubsub` (optional).
+
+• **Docker** – slim image using `python:3.12-slim-bullseye`.
+• **CI/CD** – GitHub Actions builds & tests, pushes to Artifact Registry, deploys Cloud Run (blue/green).
+
+### Functional Requirements
+
+• **Auth**
+• `POST /auth/signup` – email, password (argon2 hashed).
+• `POST /auth/login` – returns JWT.
+
+• **Audio upload**
+• `POST /audio` – multipart/form‑data.
+• Validates type (m4a, mp3, wav, flac) & < "unlimited" size by streaming straight to GCS.
+• Responds 202 + `job_id`.
+
+• **Transcription worker**
+• Cloud Run job or Cloud Tasks queue fetches audio, splits on silence into ≤ 5‑min FLAC chunks via `pydub`.
+• Calls Speech API long‑running for each chunk with diarization.
+• Stitches segments chronologically; stores full text + speaker labels.
+• Calls Gemini to create summary & action items.
+• Writes results to `transcripts` row; updates status to `done`; pushes notification.
+
+• **Transcript retrieval**
+• `GET /transcripts` – list for user (id, date, duration, language, cost).
+• `GET /transcripts/{id}` – returns text, speaker labels, summary, metadata.
+
+### Database Schema
+
+• `users`
+• `id` UUID PK
+• `email` TEXT unique not null
+• `password_hash` TEXT not null
+• `created_at` TIMESTAMP DEFAULT now()
+
+• `transcripts`
+• `id` UUID PK
+• `user_id` UUID FK → users.id ON DELETE CASCADE
+• `language` CHAR(2)
+• `original_filename` TEXT
+• `gcs_uri` TEXT
+• `status` TEXT CHECK (status IN ('pending','processing','done','error'))
+• `duration_seconds` INT
+• `speaker_count` INT
+• `transcript_text` TEXT
+• `summary_text` TEXT
+• `created_at` TIMESTAMP DEFAULT now()
+• `completed_at` TIMESTAMP
+
+• `usage`
+• `user_id` UUID PK
+• `period_start` DATE PK
+• `seconds_transcribed` INT DEFAULT 0
+• Trigger increments on transcript completion.
+
+### Non‑Functional Targets
+
+• Latency: ≤ 3 min for a 60‑min meeting.
+• Concurrency: 20+ concurrent uploads; Cloud Run concurrency = 80; auto‑scale max instances = 5 (can raise).
+• Security: all traffic HTTPS; GCS & Cloud SQL encrypted at rest; service account principle of least privilege.
+• Cost: ≤ \$50/month dev; scales linearly with transcripts.
+• Observability: request tracing + custom metrics (seconds transcribed per user).
+
+### Deployment & Ops
+
+• **Terraform** modules for Cloud SQL, Cloud Run, Storage (with lifecycle), IAM, VPC, Firestore indexes, Pub/Sub topics.
+• One production project; staging can be enabled by cloning Terraform workspace.
+• GitHub Actions: test → lint → build → push image → terraform plan → terraform apply → Cloud Run rollout.
+• On call alerts via Cloud Monitoring uptime checks & email.
+
+### Roadmap
+
+• Phase 1: MVP upload → async transcript w/ diarization & summary.
+• Phase 2: Google OAuth, subscription billing, improved push UX (progress updates per chunk).
+• Phase 3: Teams & shared transcripts, multilingual auto‑detect, real‑time captions.
+
+---
+
+*Document updated with clarified requirements – 2025‑06‑02.*

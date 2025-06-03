@@ -1,0 +1,225 @@
+Below is a practical, battle-tested launch checklist. Follow it top-to-bottom and you'll have a FastAPI container running on Cloud Run, wired to Cloud SQL, using Google Speech, and gated by JWT auth. I sprinkled in the exact gcloud / Terraform / GitHub Actions commands you'll copy-paste. After each step you'll see ▶ Next decision? notes—if you already know the answer, move on; otherwise just tell me and I'll fill the gap.
+
+⸻
+
+0 . Local prerequisites (10 min)
+
+Tool	Why	Install
+gcloud CLI >= 465	Auth + deploy	brew install --cask google-cloud-sdk
+Docker >= 24	Build image	brew install docker
+Terraform 1.8+	Infra-as-code	brew tap hashicorp/tap && brew install hashicorp/tap/terraform
+GitHub CLI	CI secrets	brew install gh
+
+Log in once:
+
+gcloud auth login
+gcloud config set project YOUR_PROJECT_ID
+gcloud config set run/region europe-west4   # ▶ Next decision? choose fastest region
+
+
+⸻
+
+1 . Bootstrap the Google Cloud project (15 min)
+
+# Enable APIs:
+gcloud services enable run.googleapis.com \
+  cloudbuild.googleapis.com artifactregistry.googleapis.com \
+  sqladmin.googleapis.com secretmanager.googleapis.com \
+  speech.googleapis.com cloudtasks.googleapis.com \
+  aiplatform.googleapis.com firestore.googleapis.com \
+  iam.googleapis.com
+
+# Create Artifact Registry repo for Docker images
+gcloud artifacts repositories create transcripts-repo \
+  --repository-format=docker --location=europe-west4
+
+▶ Next decision? Project billing : make sure billing account is attached or deploys will fail.
+
+⸻
+
+2 . Terraform skeleton (infra folder)
+
+# versions.tf
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.20"
+    }
+  }
+  required_version = ">= 1.5"
+}
+
+provider "google" {
+  project = var.project_id
+  region  = var.region
+}
+
+# variables.tf
+variable "project_id" {}
+variable "region"     { default = "europe-west4" }
+variable "db_password" { type = string }
+
+# main.tf  (excerpt)
+resource "google_sql_database_instance" "pg" {
+  name             = "transcripts-db"
+  database_version = "POSTGRES_15"
+  region           = var.region
+
+  settings {
+    tier = "db-g1-small"
+    ip_configuration { ipv4_enabled = false }
+  }
+}
+
+resource "google_sql_user" "app" {
+  name     = "appuser"
+  instance = google_sql_database_instance.pg.name
+  password = var.db_password
+}
+
+resource "google_secret_manager_secret" "jwt" {
+  secret_id = "jwt-secret"
+  replication { automatic  = true }
+}
+
+resource "google_storage_bucket" "audio" {
+  name     = "${var.project_id}-audio"
+  location = var.region
+  lifecycle_rule {
+    action { type = "Delete" }
+    condition { age = 7 }  # 7-day TTL
+  }
+}
+
+# Cloud Run service will be added by the GitHub Action after build
+
+Run once:
+
+cd infra
+terraform init
+terraform apply -var="project_id=YOUR_PROJECT_ID" -var="db_password=$(openssl rand -base64 20)"
+
+Terraform prints:
+	•	the Cloud SQL instance connection name (save it)
+	•	bucket name (already in google_storage_bucket.audio.name)
+
+⸻
+
+3 . Docker image build & local test (5 min)
+
+# in repo root
+docker build -t localhost/transcriber:dev .
+docker run -p 8000:80 -e DATABASE_URL='postgresql://...' \
+  -e GOOGLE_APPLICATION_CREDENTIALS=/tmp/creds.json localhost/transcriber:dev
+
+Hit http://localhost:8000/docs to confirm FastAPI is alive.
+
+⸻
+
+4 . GitHub Actions for CI/CD (8 min)
+
+.github/workflows/deploy.yml
+
+name: Deploy to Cloud Run
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions: { contents: read, id-token: write }
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_PROVIDER }}
+          service_account: ${{ secrets.GCP_SA_EMAIL }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Build & push image
+        run: |
+          IMAGE="europe-west4-docker.pkg.dev/$GCP_PROJECT/transcripts-repo/backend:$GITHUB_SHA"
+          gcloud builds submit --tag $IMAGE .
+
+      - name: Deploy Cloud Run
+        run: |
+          gcloud run deploy transcripts-api \
+            --image $IMAGE \
+            --region europe-west4 \
+            --platform managed \
+            --allow-unauthenticated=false \
+            --set-env-vars "DB_INSTANCE=projects/$GCP_PROJECT/instances/transcripts-db" \
+            --set-secrets "JWT_SECRET=projects/$GCP_PROJECT/secrets/jwt-secret:latest"
+
+▶ Next decisions:
+	•	Domain mapping (custom URL?) — if yes, add --domain in deploy step.
+	•	Workload Identity — you'll create a CI-deploy service account and save its email & provider string in repo secrets.
+
+⸻
+
+5 . Connect Cloud Run ↔ Cloud SQL (3 min)
+
+Add this flag to the gcloud run deploy command:
+
+--add-cloudsql-instances=YOUR_CONNECTION_NAME
+
+FastAPI picks it up via the Unix socket /cloudsql/YOUR_CONNECTION_NAME.
+
+Update DATABASE_URL env in Cloud Run to:
+
+postgresql+asyncpg://appuser:$DB_PASSWORD@/postgres?host=/cloudsql/YOUR_CONNECTION_NAME
+
+Secrets:
+
+gcloud secrets create db-password --data-file=<(echo 'yourpass')
+gcloud secrets add-iam-policy-binding db-password \
+  --member="serviceAccount:YOUR_RUN_SA" --role="roles/secretmanager.secretAccessor"
+
+
+⸻
+
+6 . Service account least-privilege (2 min)
+
+gcloud iam service-accounts create transcripts-api-sa
+gcloud projects add-iam-policy-binding $PROJECT \
+  --member serviceAccount:transcripts-api-sa@$PROJECT.iam.gserviceaccount.com \
+  --role roles/run.invoker   # for public endpoints
+gcloud projects add-iam-policy-binding $PROJECT \
+  --member serviceAccount:transcripts-api-sa@$PROJECT.iam.gserviceaccount.com \
+  --role roles/cloudsql.client \
+  --role roles/storage.objectAdmin \
+  --role roles/speech.admin
+
+Assign this SA to the Cloud Run service (--service-account transcripts-api-sa@...).
+
+⸻
+
+7 . Smoke test in prod (2 min)
+
+curl -X POST https://YOUR_RUN_URL/auth/signup \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@demo.io","password":"Secret1234"}'
+
+You should receive 200 OK with JWT.
+
+⸻
+
+8 . Push notifications workflow (later)
+	1.	Create Firebase project → add iOS app bundle ID.
+	2.	In backend, after each transcript finishes, publish to Firestore status field.
+	3.	Cloud Function triggers FCM to device token.
+
+⸻
+
+What I need from you before we execute
+	1.	Preferred GCP region (europe-west4, us-central1, …).
+	2.	Repo URL / default branch so I can tailor the GitHub Action path.
+	3.	Custom domain? yes/no.
+	4.	Any extra env vars (e.g., GEMINI_API_KEY).
+
+Tell me these and I'll polish the Terraform & CI snippets to exact values, or we can walk through each gcloud command together.
