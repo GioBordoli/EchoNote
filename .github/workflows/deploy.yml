@@ -1,8 +1,13 @@
+<<<<<<< HEAD
 name: Deploy EchoNote to Cloud Run
+=======
+name: Deploy to Cloud Run
+>>>>>>> 6f7ce9dba215ce010b6f6172dd2aa3895c653209
 on:
   push:
     branches: [main]
 
+<<<<<<< HEAD
 env:
   GCP_PROJECT: echonote-461723
   GCP_REGION: europe-west4
@@ -22,11 +27,22 @@ jobs:
 
       - name: Authenticate to Google Cloud
         id: auth
+=======
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions: { contents: read, id-token: write }
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+>>>>>>> 6f7ce9dba215ce010b6f6172dd2aa3895c653209
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_PROVIDER }}
           service_account: ${{ secrets.GCP_SA_EMAIL }}
 
+<<<<<<< HEAD
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
@@ -59,3 +75,21 @@ jobs:
           URL=$(gcloud run services describe $SERVICE_NAME --region=$GCP_REGION --format='value(status.url)')
           echo "🚀 Service deployed at: $URL"
           echo "📖 API docs available at: $URL/docs" 
+=======
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Build & push image
+        run: |
+          IMAGE="europe-west4-docker.pkg.dev/$GCP_PROJECT/transcripts-repo/backend:$GITHUB_SHA"
+          gcloud builds submit --tag $IMAGE .
+
+      - name: Deploy Cloud Run
+        run: |
+          gcloud run deploy transcripts-api \
+            --image $IMAGE \
+            --region europe-west4 \
+            --platform managed \
+            --allow-unauthenticated=false \
+            --set-env-vars "DB_INSTANCE=projects/$GCP_PROJECT/instances/transcripts-db" \
+            --set-secrets "JWT_SECRET=projects/$GCP_PROJECT/secrets/jwt-secret:latest"
+>>>>>>> 6f7ce9dba215ce010b6f6172dd2aa3895c653209
